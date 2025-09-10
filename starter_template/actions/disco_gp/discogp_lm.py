@@ -561,7 +561,7 @@ class DiscoGPTransformer(nn.Module):
         for i, batch_inputs in enumerate(dl):
             batch_logits_orig = self(batch_inputs['input_ids'].to(self.cfg.device))[0]
 
-            if self.cfg.task_type in ['ioi', 'blimp']:
+            if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp']:
                 batch_seq_lens = batch_inputs['seq_lens']
                 batch_size = batch_logits_orig.shape[0]
                 logits_target_good_orig = batch_logits_orig[torch.arange(batch_size), batch_seq_lens - 1, batch_inputs['target good']]
@@ -569,7 +569,7 @@ class DiscoGPTransformer(nn.Module):
                 logits_gb_orig = torch.stack([logits_target_good_orig, logits_target_bad_orig], -1)  # (B, 2)
                 record[i] = logits_gb_orig.cpu()
 
-            elif self.cfg.task_type in ['pararel']:
+            elif self.cfg.task_type in ['pararel', 'dbpedia_14', 'glue-sst2']:
                 batch_seq_lens = batch_inputs['seq_lens']
                 batch_size = batch_logits_orig.shape[0]
                 full_logit = batch_logits_orig[torch.arange(batch_size), batch_seq_lens - 1]  # (B, answer_idx_vocab_size)
@@ -588,9 +588,9 @@ class DiscoGPTransformer(nn.Module):
 
         For PARArel, restrict logits to the known answer vocab.
         """
-        if self.cfg.task_type in ['ioi', 'blimp']:
+        if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp']:
             return compute_faith_loss_binary_label(batch_logits_masked, batch_inputs, original_logits)
-        elif self.cfg.task_type in ['pararel']:
+        elif self.cfg.task_type in ['pararel', 'dbpedia_14', 'glue-sst2']:
             batch_logits_masked = batch_logits_masked[:, :, self.answer_idx_vocab]
             return compute_faith_loss_multi_label(batch_logits_masked, batch_inputs, original_logits)
         else:
@@ -598,9 +598,9 @@ class DiscoGPTransformer(nn.Module):
 
     def compute_complete_loss(self, batch_logits_masked, batch_inputs):
         """Compute completeness loss for the current task type."""
-        if self.cfg.task_type in ['ioi', 'blimp']:
+        if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp']:
             return compute_complete_loss_binary_label(batch_logits_masked, batch_inputs)
-        elif self.cfg.task_type in ['pararel']:
+        elif self.cfg.task_type in ['pararel', 'dbpedia_14', 'glue-sst2']:
             batch_logits_masked = batch_logits_masked[:, :, self.answer_idx_vocab]
             return compute_complete_loss_multi_label(batch_logits_masked, batch_inputs)
         else:

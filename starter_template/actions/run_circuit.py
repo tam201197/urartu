@@ -44,7 +44,6 @@ class RunCircuit(Action):
             exp = exp_cfg,
             output_dir_path = output_dir_path
         )
-        #circuit_cfg['output_dir_path'] = self.cfg.run_dir
         return circuit_cfg
     
     def choose_best_model(self, epoch_results):
@@ -52,7 +51,7 @@ class RunCircuit(Action):
         df.insert(0, 'index', range(0, len(df)))
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         df.to_excel(os.path.join(self.cfg.run_dir, f'train_results_{timestamp}.xlsx'), index=False)
-        df['composite_score'] = df['train_acc'] * df['test_acc'] * df['eval_acc'] * (1- df['edge_density']) * (1 - df['weight_density'])
+        df['composite_score'] = df['eval_acc'] * (1- df['edge_density']) * (1 - df['weight_density'])
         best_epoch = df['composite_score'].idxmax()
         best_result = df.iloc[best_epoch]
         print('Best result:')

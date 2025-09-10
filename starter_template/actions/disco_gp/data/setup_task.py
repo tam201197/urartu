@@ -22,6 +22,7 @@ from .ioi_dataset import IOIGeneratorDataset
 import torch
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
+from transformers import DataCollatorWithPadding
 
 import random
 import pandas as pd
@@ -70,17 +71,163 @@ def setup_task(disco_gp):
         return setup_blimp(disco_gp)
     elif disco_gp.cfg.task_type == 'pararel':
         return setup_pararel(disco_gp)
-"""     elif disco_gp.cfg.task_type == 'glue':
-        return setup_sst2(disco_gp.cfg, disco_gp.tokenizer)
+    elif disco_gp.cfg.task_type == 'glue-qqp':
+        return setup_qqp(disco_gp)
+    elif disco_gp.cfg.task_type == 'glue-sst2':
+        return setup_sst2(disco_gp)
+    elif disco_gp.cfg.task_type == 'dbpedia_14':
+        return setup_dbpedia(disco_gp)
     elif disco_gp.cfg.task_type == 'boolq':
         data_dict = setup_boolq(disco_gp.cfg, disco_gp.tokenizer)
-    elif disco_gp.cfg.task_type == 'winogrande':
-        data_dict = setup_winogrande(disco_gp.cfg, disco_gp.tokenizer)
     elif disco_gp.cfg.task_type == 'copa':
         data_dict = setup_copa(disco_gp.cfg, disco_gp.tokenizer)
     elif disco_gp.cfg.task_type == 'snli':
         data_dict = setup_snli(disco_gp.cfg, disco_gp.tokenizer)
-    return get_dataloader_big_dataset(disco_gp.cfg, data_dict, disco_gp.tokenizer) """
+    return get_dataloader_big_dataset(disco_gp.cfg, data_dict, disco_gp.tokenizer)
+
+def get_stratified_subset(task, sub_task, n_per_class=500, seed=42):
+    """Get a balanced subset (equal pos/neg)."""
+    random.seed(seed)
+    full_dataset = load_dataset(task, sub_task)
+    train_set = full_dataset["train"]
+
+    # Group by label
+    label_buckets = defaultdict(list)
+    for ex in train_set:
+        label_buckets[ex["label"]].append(ex)
+
+    for label, samples in label_buckets.items():
+        if len(samples) < n_per_class:
+            raise ValueError(f"Not enough samples for label {label}")
+
+    subset_data = []
+    for label in [0, 1]:
+        sampled = random.sample(label_buckets[label], n_per_class)
+        subset_data.extend(sampled)
+
+    random.shuffle(subset_data)
+    return Dataset.from_list(subset_data)
+
+
+def setup_qqp(disco_gp):
+    """Prepare QQP dataset with stratified train/dev/test splits"""
+    dataset = get_stratified_subset(task='glue', sub_task='qqp', n_per_class=disco_gp.cfg.n_per_class)
+
+    prompts, targets, targets_good, targets_bad = [], [], [], []
+
+    for row in dataset:
+        q1, q2, label = row["question1"], row["question2"], row["label"]
+        prompt = f"Question 1: {q1}\nQuestion 2: {q2}\nAre these questions duplicates?"
+
+        prompts.append(prompt)
+
+        good = " yes" if label == 1 else " no"
+        bad = " no" if label == 1 else " yes"
+
+        targets_good.append(good)
+        targets_bad.append(bad)
+        targets.append((good.strip(), bad.strip()))
+
+    tokenized = disco_gp.tokenizer(
+        prompts, return_tensors="pt", padding=True, truncation=True, max_length=128
+    )
+
+    data_dict = {
+        "prompts": prompts,
+        "targets": targets,
+        "input_ids": tokenized["input_ids"],
+        "seq_lens": tokenized["attention_mask"].sum(-1),
+        "target good": [
+            token_ids[0] for token_ids in disco_gp.tokenizer(targets_good, add_special_tokens=False)["input_ids"]
+        ],
+        "target bad": [
+            token_ids[0] for token_ids in disco_gp.tokenizer(targets_bad, add_special_tokens=False)["input_ids"]
+        ],
+    }
+
+    # Split into train / (dev+test) first, then split latter into dev / test
+    dev_test, test_over_dev = split_ratios(disco_gp.cfg.ds_split_ratios)
+
+    ds = Dataset.from_dict(data_dict).train_test_split(dev_test).with_format('torch')
+
+    return get_dataloader(disco_gp, ds, test_over_dev)
+
+
+def setup_dbpedia(disco_gp):
+    """Prepare DBpedia Ontology dataset for classification.
+
+    Each example is (title + content) → one of 14 ontology classes.
+    We tokenize the text and map labels to indices.
+    """
+
+    # 1) Load DBpedia dataset
+    ds = load_dataset("dbpedia_14")
+
+    # 2) Preprocess: tokenize without padding
+    def preprocess(batch):
+        text = [t + " " + c for t, c in zip(batch["title"], batch["content"])]
+        tokenized = disco_gp.tokenizer(text, truncation=True)
+        seq_lens = [len(ids) for ids in tokenized["input_ids"]]
+        return {
+            "prompt": text,                             # keep raw string
+            "input_ids": tokenized["input_ids"],        # list[int]
+            "attention_mask": tokenized["attention_mask"],
+            "seq_lens": seq_lens,
+            "answer_idx": batch["label"],               # rename to PARArel
+        }
+
+    ds = ds.map(preprocess, batched=True, remove_columns=ds["train"].column_names)
+
+    # 3) Attach answer vocab (ontology class indices + names)
+    class_names = [
+        "Company",
+        "EducationalInstitution",
+        "Artist",
+        "Athlete",
+        "OfficeHolder",
+        "MeanOfTransportation",
+        "Building",
+        "NaturalPlace",
+        "Village",
+        "Animal",
+        "Plant",
+        "Album",
+        "Film",
+        "WrittenWork",
+    ]
+    ds.answer_idx_vocab = list(range(len(class_names)))
+    disco_gp.answer_idx_vocab = ds.answer_idx_vocab
+
+    # 4) Split into train/dev/test
+    dev_test, test_over_dev = split_ratios(disco_gp.cfg.ds_split_ratios)
+    split_ds = ds["train"].train_test_split(dev_test)
+    eval_test_ds = split_ds["test"].train_test_split(test_over_dev)
+
+    train_ds = split_ds["train"]
+    eval_ds = eval_test_ds["train"]
+    test_ds = eval_test_ds["test"]
+
+    # 5) Collator for dynamic padding
+    collator = DataCollatorWithPadding(tokenizer=disco_gp.tokenizer, return_tensors="pt")
+
+    def collate_with_prompt(batch):
+        prompts = [ex["prompt"] for ex in batch]
+        numeric_batch = [{k: v for k, v in ex.items() if k != "prompt"} for ex in batch]
+        collated = collator(numeric_batch)
+        collated["prompt"] = prompts
+        return collated
+
+    # 6) DataLoaders
+    train_dl = DataLoader(train_ds, batch_size=disco_gp.cfg.batch_size,
+                          shuffle=True, collate_fn=collate_with_prompt)
+    eval_dl = DataLoader(eval_ds, batch_size=disco_gp.cfg.batch_size,
+                         shuffle=False, collate_fn=collate_with_prompt)
+    test_dl = DataLoader(test_ds, batch_size=disco_gp.cfg.batch_size,
+                         shuffle=False, collate_fn=collate_with_prompt)
+
+    return Namespace(train=train_dl, eval=eval_dl, test=test_dl, class_names=class_names)
+
+
 
 def get_dataloader_big_dataset(cfg, data_dict, tokenizer, split_ratio=0.3):
     """
@@ -141,7 +288,7 @@ def balanced_subset(dataset, n_per_class):
     balanced_df = pd.concat([yes_df, no_df]).sample(frac=1, random_state=42)  # shuffle
     return Dataset.from_pandas(balanced_df)
 
-def setup_boolq(cfg, tokenizer, subset_size=None, n_per_class=500):
+def setup_boolq(disco_gp, n_per_class=500):
     boolq_ds = load_dataset("boolq")
 
     prompts, targets, targets_good, targets_bad = [], [], [], []
@@ -149,8 +296,6 @@ def setup_boolq(cfg, tokenizer, subset_size=None, n_per_class=500):
     # Sampling options
     if n_per_class is not None:  # Balanced sampling
         boolq_train = balanced_subset(boolq_ds["train"], n_per_class)
-    elif subset_size is not None:  # Random subset
-        boolq_train = boolq_ds["train"].shuffle(seed=42).select(range(subset_size))
     else:
         boolq_train = boolq_ds["train"]
 
@@ -170,7 +315,7 @@ def setup_boolq(cfg, tokenizer, subset_size=None, n_per_class=500):
         targets_good.append(good)
         targets_bad.append(bad)
 
-    tokenized = tokenizer(
+    tokenized = disco_gp.tokenizer(
         prompts,
         return_tensors="pt",
         padding=True,
@@ -187,11 +332,11 @@ def setup_boolq(cfg, tokenizer, subset_size=None, n_per_class=500):
     first_token_idx = 0
     data_dict["target good"] = [
         token_ids[first_token_idx]
-        for token_ids in tokenizer(targets_good, add_special_tokens=False)["input_ids"]
+        for token_ids in disco_gp.tokenizer(targets_good, add_special_tokens=False)["input_ids"]
     ]
     data_dict["target bad"] = [
         token_ids[first_token_idx]
-        for token_ids in tokenizer(targets_bad, add_special_tokens=False)["input_ids"]
+        for token_ids in disco_gp.tokenizer(targets_bad, add_special_tokens=False)["input_ids"]
     ]
     return data_dict
 
@@ -260,38 +405,6 @@ def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
     ]
     return data_dict
 
-def setup_winogrande(disco_gp):
-    ds = load_dataset("winogrande", "winogrande_s")["train"]
-
-    prompts, targets, targets_good, targets_bad = [], [], [], []
-
-    for ex in ds:
-        sentence = ex["sentence"]
-        option1, option2 = ex["option1"], ex["option2"]
-        correct = option1 if ex["answer"] == "1" else option2
-        incorrect = option2 if correct == option1 else option1
-
-        # Replace the blank "_" with nothing for prompt clarity
-        prompt = sentence.replace("_", "_____") + "\nFill in the blank:"
-        prompts.append(prompt)
-
-        targets.append((correct, incorrect))
-        targets_good.append(" " + correct)
-        targets_bad.append(" " + incorrect)
-
-    tokenized = disco_gp.tokenizer(prompts, return_tensors='pt', padding=True, truncation=True)
-
-    data_dict = {
-        'prompts': prompts,
-        'targets': targets,
-        'input_ids': tokenized['input_ids'],
-        'seq_lens': tokenized['attention_mask'].sum(-1),
-        'target good': [ids[0] for ids in disco_gp.tokenizer(targets_good, add_special_tokens=False)['input_ids']],
-        'target bad': [ids[0] for ids in disco_gp.tokenizer(targets_bad, add_special_tokens=False)['input_ids']],
-    }
-    
-    return get_dataloader(disco_gp, ds, test_over_dev)
-
 def setup_copa(disco_gp):
     # Load dataset
     copa_ds = load_dataset("super_glue", "copa")
@@ -345,37 +458,8 @@ def setup_copa(disco_gp):
 
     return get_dataloader(disco_gp, ds, test_over_dev)
 
-
-
-def get_stratified_sst2_subset(n_per_class=500, seed=42):
-    random.seed(seed)
-    full_dataset = load_dataset("glue", "sst2")
-    train_set = full_dataset["train"]
-
-    # Group examples by label (0 = negative, 1 = positive)
-    label_buckets = defaultdict(list)
-    for ex in train_set:
-        label_buckets[ex["label"]].append(ex)
-
-    # Check if enough examples exist for each class
-    for label, samples in label_buckets.items():
-        if len(samples) < n_per_class:
-            raise ValueError(f"Not enough samples for label {label}")
-
-    # Sample n_per_class from each label
-    subset_data = []
-    for label in [0, 1]:
-        sampled = random.sample(label_buckets[label], n_per_class)
-        subset_data.extend(sampled)
-
-    # Shuffle the final subset
-    random.shuffle(subset_data)
-
-    return Dataset.from_list(subset_data)
-
-
-def setup_sst2(disco_gp, n_per_class=500):
-    dataset = get_stratified_sst2_subset(n_per_class)    
+def setup_sst2(disco_gp):
+    dataset = get_stratified_subset(task="glue", sub_task="sst2", n_per_class=disco_gp.cfg.n_per_class)    
     prompts, targets, targets_good, targets_bad = [], [], [], []
 
     for row in dataset:
@@ -496,7 +580,7 @@ def setup_blimp(disco_gp):
         token_ids[first_token_idx] for token_ids in
         disco_gp.tokenizer(targets_bad, add_special_tokens=False)['input_ids']
     ]
-        # Split into train / (dev+test) first, then split latter into dev / test
+    # Split into train / (dev+test) first, then split latter into dev / test
     dev_test, test_over_dev = split_ratios(disco_gp.cfg.ds_split_ratios)
 
     ds = Dataset.from_dict(data_dict).train_test_split(dev_test).with_format('torch')
