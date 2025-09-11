@@ -391,6 +391,7 @@ class DiscoGPTransformer(nn.Module):
         - Prepares tokenizer and data loaders via `setup_task`.
         """
         model = cls(cfg)
+        print(f'cgf: {cfg}')
         print("cfg name:", cfg.full_model_name)
         state_dict = HookedTransformer.from_pretrained(cfg.full_model_name).state_dict()
         model.hook_state_dict(state_dict)
@@ -561,7 +562,7 @@ class DiscoGPTransformer(nn.Module):
         for i, batch_inputs in enumerate(dl):
             batch_logits_orig = self(batch_inputs['input_ids'].to(self.cfg.device))[0]
 
-            if self.cfg.task_type in ['ioi', 'blimp']:
+            if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp', 'glue-sst2', 'snli']:
                 batch_seq_lens = batch_inputs['seq_lens']
                 batch_size = batch_logits_orig.shape[0]
                 logits_target_good_orig = batch_logits_orig[torch.arange(batch_size), batch_seq_lens - 1, batch_inputs['target good']]
@@ -588,7 +589,7 @@ class DiscoGPTransformer(nn.Module):
 
         For PARArel, restrict logits to the known answer vocab.
         """
-        if self.cfg.task_type in ['ioi', 'blimp']:
+        if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp', 'glue-sst2', 'snli']:
             return compute_faith_loss_binary_label(batch_logits_masked, batch_inputs, original_logits)
         elif self.cfg.task_type in ['pararel']:
             batch_logits_masked = batch_logits_masked[:, :, self.answer_idx_vocab]
@@ -598,7 +599,7 @@ class DiscoGPTransformer(nn.Module):
 
     def compute_complete_loss(self, batch_logits_masked, batch_inputs):
         """Compute completeness loss for the current task type."""
-        if self.cfg.task_type in ['ioi', 'blimp']:
+        if self.cfg.task_type in ['ioi', 'blimp', 'glue-qqp', 'glue-sst2', 'snli']:
             return compute_complete_loss_binary_label(batch_logits_masked, batch_inputs)
         elif self.cfg.task_type in ['pararel']:
             batch_logits_masked = batch_logits_masked[:, :, self.answer_idx_vocab]
@@ -618,15 +619,19 @@ class DiscoGPTransformer(nn.Module):
     def search(self, modes='we', trial = None):
         """Run pruning for weights ('w'), edges ('e'), or both (default 'we')."""
         result = []
+        weight_mask = None
+        edge_mask = None
         if 'w' in modes:
-            result = result + self.run_prune(mode='w', trial = trial)
+            r, weight_mask, edge_mask = self.run_prune(mode='w', trial = trial)
+            result = result + r
 
         gc.collect()
         torch.cuda.empty_cache()
 
         if 'e' in modes:
-            result = result + self.run_prune(mode='e', trial = trial)
-        return result
+            r, weight_mask, edge_mask = self.run_prune(mode='e', trial = trial)
+            result = result + r
+        return result, weight_mask, edge_mask
 
     def evaluate_and_report(self, epoch=None, mode=None, meta={}, trial = None):
         """Evaluate on train/eval/test splits and pretty-print a summary."""
@@ -690,6 +695,9 @@ class DiscoGPTransformer(nn.Module):
             disable=self.cfg.get('disable_tqdm', False))
 
         list_results = []
+        best_score = 0
+        weight_mask = None
+        edge_mask = None
         for i, epoch in enumerate(epoch_loop):
             # Lambda scheduling (warmup/cooldown, etc.)
             lambda_sparse = schedule_epoch_lambda(
@@ -760,21 +768,28 @@ class DiscoGPTransformer(nn.Module):
                         'lambda_complete': lambda_complete
                     }, trial=trial)
                 list_results.append(result)
-
-            weight_mask = self.mask_logits_dict_weight
-            edge_mask = self.mask_logits_dict_edge
-
-            if self.cfg.has('save_every', 'output_dir_path') and self.cfg.save_every and i % self.cfg.save_every == self.cfg.save_every - 1:
-                output_dir = Path(self.cfg.output_dir_path) / self.cfg.exp_name
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                if mode == 'w':
-                    torch.save(weight_mask, output_dir / f'weight_mask_{mode}_epoch{epoch}.pt')
-                if mode == 'e':
-                    torch.save(edge_mask, output_dir / f'edge_mask_{mode}_epoch{epoch}.pt')
+                if self.cfg.modes == 'we' and mode == 'e':
+                    current_score = result['eval_acc'] * (1-result['edge_density']) * (1 - result['weight_density'])
+                    if current_score >= best_score:
+                        best_score = current_score
+                        if self.cfg.save_mask: 
+                            weight_mask = self.mask_logits_dict_weight
+                            edge_mask = self.mask_logits_dict_edge
+                elif self.cfg.modes == 'w':
+                    current_score = result['eval_acc'] * (1 - result['weight_density'])
+                    if current_score >= best_score:
+                        best_score = current_score
+                        if self.cfg.save_mask: 
+                            weight_mask = self.mask_logits_dict_weight
+                elif self.cfg.modes == 'e':
+                    current_score = result['eval_acc'] * (1-result['edge_density'])
+                    if current_score >= best_score:
+                        best_score = current_score
+                        if self.cfg.save_mask: 
+                            edge_mask = self.mask_logits_dict_edge
 
         del mask_logits
         del optimizer
         gc.collect()
         torch.cuda.empty_cache()
-        return list_results
+        return list_results, weight_mask, edge_mask

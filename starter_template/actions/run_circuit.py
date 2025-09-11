@@ -35,7 +35,7 @@ class RunCircuit(Action):
                                                   self.cfg.action_config.dataset.test_split)
                         })
         exp_cfg = Config(**self.cfg.action_config.exp_cfg)
-        output_dir_path = Config(**{'run_dir': self.cfg.run_dir})
+        output_dir_path = Config(**{'output_dir_path': self.cfg.run_dir})
         circuit_cfg = Config.from_configs(
             weight = weight_cfg,
             edge = edge_cfg,
@@ -44,7 +44,6 @@ class RunCircuit(Action):
             exp = exp_cfg,
             output_dir_path = output_dir_path
         )
-        #circuit_cfg['output_dir_path'] = self.cfg.run_dir
         return circuit_cfg
     
     def choose_best_model(self, epoch_results):
@@ -52,7 +51,7 @@ class RunCircuit(Action):
         df.insert(0, 'index', range(0, len(df)))
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         df.to_excel(os.path.join(self.cfg.run_dir, f'train_results_{timestamp}.xlsx'), index=False)
-        df['composite_score'] = df['train_acc'] * df['test_acc'] * df['eval_acc'] * (1- df['edge_density']) * (1 - df['weight_density'])
+        df['composite_score'] = df['eval_acc'] * (1- df['edge_density']) * (1 - df['weight_density'])
         best_epoch = df['composite_score'].idxmax()
         best_result = df.iloc[best_epoch]
         print('Best result:')
@@ -94,7 +93,7 @@ class RunCircuit(Action):
     
     def run_circuit(self):
         # Reproducibility
-        set_seed(self.cfg.action_config.seed)
+        set_seed(self.cfg.action_config.exp_cfg.seed)
         circuit_cfg = self.setup_config()
         print(f'weight_lr: {circuit_cfg.weight.lr}')
         print(f'edge_lr: {circuit_cfg.edge.lr}')
@@ -107,12 +106,20 @@ class RunCircuit(Action):
         print("[Step] Baseline evaluation:")
         model.evaluate_and_report(epoch=0, mode="baseline")
 
-        print(f"[Step] Pruning (modes='{self.cfg.action_config.modes}')…")
+        print(f"[Step] Pruning (modes='{self.cfg.action_config.exp_cfg.modes}')…")
         #model.search(modes=self.cfg.action_config.modes)
-        epoch_results = model.search(modes=self.cfg.action_config.modes)
+        epoch_results, weight_mask, edge_mask = model.search(modes=self.cfg.action_config.exp_cfg.modes)
         print('[Step] Choose best moodel')
         self.choose_best_model(epoch_results)
 
+        if circuit_cfg.has('save_mask') and circuit_cfg.save_mask:
+            output_dir = os.Path(self.cfg.output_dir_path)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for mode in circuit_cfg.modes: 
+                if mode == 'w':
+                    torch.save(weight_mask, output_dir / f'weight_mask.pt')
+                if mode == 'e':
+                    torch.save(edge_mask, output_dir / f'edge_mask.pt')
         print("[Step] Final evaluation:")
         model.evaluate_and_report(epoch="final", mode="pruned")
 
