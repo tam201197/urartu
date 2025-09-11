@@ -22,7 +22,6 @@ from .ioi_dataset import IOIGeneratorDataset
 import torch
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
-from transformers import DataCollatorWithPadding
 
 import random
 import pandas as pd
@@ -75,15 +74,10 @@ def setup_task(disco_gp):
         return setup_qqp(disco_gp)
     elif disco_gp.cfg.task_type == 'glue-sst2':
         return setup_sst2(disco_gp)
-    elif disco_gp.cfg.task_type == 'dbpedia_14':
-        return setup_dbpedia(disco_gp)
-    elif disco_gp.cfg.task_type == 'boolq':
-        data_dict = setup_boolq(disco_gp.cfg, disco_gp.tokenizer)
-    elif disco_gp.cfg.task_type == 'copa':
-        data_dict = setup_copa(disco_gp.cfg, disco_gp.tokenizer)
+    #elif disco_gp.cfg.task_type == 'boolq':
+    #    data_dict = setup_boolq(disco_gp.cfg, disco_gp.tokenizer)
     elif disco_gp.cfg.task_type == 'snli':
-        data_dict = setup_snli(disco_gp.cfg, disco_gp.tokenizer)
-    return get_dataloader_big_dataset(disco_gp.cfg, data_dict, disco_gp.tokenizer)
+        return setup_snli(disco_gp)
 
 def get_stratified_subset(task, sub_task, n_per_class=500, seed=42):
     """Get a balanced subset (equal pos/neg)."""
@@ -151,81 +145,6 @@ def setup_qqp(disco_gp):
     ds = Dataset.from_dict(data_dict).train_test_split(dev_test).with_format('torch')
 
     return get_dataloader(disco_gp, ds, test_over_dev)
-
-
-def setup_dbpedia(disco_gp):
-    """Prepare DBpedia Ontology dataset for classification.
-
-    Each example is (title + content) → one of 14 ontology classes.
-    We tokenize the text and map labels to indices.
-    """
-
-    # 1) Load DBpedia dataset
-    ds = load_dataset("dbpedia_14")
-
-    # 2) Preprocess: tokenize without padding
-    def preprocess(batch):
-        text = [t + " " + c for t, c in zip(batch["title"], batch["content"])]
-        tokenized = disco_gp.tokenizer(text, truncation=True)
-        seq_lens = [len(ids) for ids in tokenized["input_ids"]]
-        return {
-            "prompt": text,                             # keep raw string
-            "input_ids": tokenized["input_ids"],        # list[int]
-            "attention_mask": tokenized["attention_mask"],
-            "seq_lens": seq_lens,
-            "answer_idx": batch["label"],               # rename to PARArel
-        }
-
-    ds = ds.map(preprocess, batched=True, remove_columns=ds["train"].column_names)
-
-    # 3) Attach answer vocab (ontology class indices + names)
-    class_names = [
-        "Company",
-        "EducationalInstitution",
-        "Artist",
-        "Athlete",
-        "OfficeHolder",
-        "MeanOfTransportation",
-        "Building",
-        "NaturalPlace",
-        "Village",
-        "Animal",
-        "Plant",
-        "Album",
-        "Film",
-        "WrittenWork",
-    ]
-    ds.answer_idx_vocab = list(range(len(class_names)))
-    disco_gp.answer_idx_vocab = ds.answer_idx_vocab
-
-    # 4) Split into train/dev/test
-    dev_test, test_over_dev = split_ratios(disco_gp.cfg.ds_split_ratios)
-    split_ds = ds["train"].train_test_split(dev_test)
-    eval_test_ds = split_ds["test"].train_test_split(test_over_dev)
-
-    train_ds = split_ds["train"]
-    eval_ds = eval_test_ds["train"]
-    test_ds = eval_test_ds["test"]
-
-    # 5) Collator for dynamic padding
-    collator = DataCollatorWithPadding(tokenizer=disco_gp.tokenizer, return_tensors="pt")
-
-    def collate_with_prompt(batch):
-        prompts = [ex["prompt"] for ex in batch]
-        numeric_batch = [{k: v for k, v in ex.items() if k != "prompt"} for ex in batch]
-        collated = collator(numeric_batch)
-        collated["prompt"] = prompts
-        return collated
-
-    # 6) DataLoaders
-    train_dl = DataLoader(train_ds, batch_size=disco_gp.cfg.batch_size,
-                          shuffle=True, collate_fn=collate_with_prompt)
-    eval_dl = DataLoader(eval_ds, batch_size=disco_gp.cfg.batch_size,
-                         shuffle=False, collate_fn=collate_with_prompt)
-    test_dl = DataLoader(test_ds, batch_size=disco_gp.cfg.batch_size,
-                         shuffle=False, collate_fn=collate_with_prompt)
-
-    return Namespace(train=train_dl, eval=eval_dl, test=test_dl, class_names=class_names)
 
 
 
@@ -340,7 +259,8 @@ def setup_boolq(disco_gp, n_per_class=500):
     ]
     return data_dict
 
-def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
+
+def setup_snli(disco_gp, n_per_class=500):
     snli_ds = load_dataset("snli")
 
     # Filter out -1 labels (missing)
@@ -356,8 +276,6 @@ def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
             label_subset = [ex for ex in snli_train if ex["label"] == label]
             samples.extend(random.sample(label_subset, min(n_per_class, len(label_subset))))
         snli_train = Dataset.from_list(samples)
-    elif subset_size is not None:
-        snli_train = snli_train.shuffle(seed=42).select(range(subset_size))
 
     prompts, targets, tg, tb = [], [], [], []
 
@@ -369,12 +287,7 @@ def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
         gold_label = label_map[ex["label"]]
 
         # Instruction-style prompt with explicit label choices
-        instruction = (
-            "Decide the relationship between the premise and the hypothesis. "
-            "Choose only one of: entailment, neutral, contradiction."
-        )
-        input_text = f"Premise: {premise}\nHypothesis: {hypothesis}"
-        prompt = f"Instruction: {instruction}\nInput: {input_text}\nOutput:"
+        prompt = f"Premise: {premise}\nHypothesis: {hypothesis}\nIs the hypothesis entailed, neutral, or contradictory?"
 
         # Good target
         good = f" {gold_label}"
@@ -387,7 +300,7 @@ def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
         targets.append((good.strip(), bad.strip()))
         tg.append(good)
         tb.append(bad)
-    tokenized = tokenizer(prompts, return_tensors="pt", padding=True,
+    tokenized = disco_gp.tokenizer(prompts, return_tensors="pt", padding=True,
                                    truncation=True)
 
     data_dict = {
@@ -398,58 +311,10 @@ def setup_snli(cfg, tokenizer, subset_size=None, n_per_class=500):
     }
 
     data_dict["target good"] = [
-        ids[0] for ids in tokenizer(tg, add_special_tokens=False)["input_ids"]
+        ids[0] for ids in disco_gp.tokenizer(tg, add_special_tokens=False)["input_ids"]
     ]
     data_dict["target bad"] = [
-        ids[0] for ids in tokenizer(tb, add_special_tokens=False)["input_ids"]
-    ]
-    return data_dict
-
-def setup_copa(disco_gp):
-    # Load dataset
-    copa_ds = load_dataset("super_glue", "copa")
-
-    prompts, targets, targets_good, targets_bad = [], [], [], []
-
-    for row in copa_ds['train']:
-        premise = row['premise']
-        choice1 = row['choice1']
-        choice2 = row['choice2']
-        label = row['label']  # 0 means choice1 is correct, 1 means choice2 is correct
-
-        # Determine connector word
-        connector = " because " if row['question'] == "cause" else " so "
-        prompt = premise + connector
-
-        # Assign good/bad targets
-        if label == 0:
-            target_good, target_bad = choice1, choice2
-        else:
-            target_good, target_bad = choice2, choice1
-
-        prompts.append(prompt)
-        targets.append((target_good, target_bad))
-        targets_good.append(" " + target_good)
-        targets_bad.append(" " + target_bad)
-
-    # Build data_dict
-    data_dict = {
-        "prompts": prompts,
-        "targets": targets,
-    }
-
-    tokenized = disco_gp.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    data_dict["input_ids"] = tokenized["input_ids"]
-    data_dict["seq_lens"] = tokenized["attention_mask"].sum(-1)
-
-    first_token_idx = 0
-    data_dict["target good"] = [
-        token_ids[first_token_idx] for token_ids in
-        disco_gp.tokenizer(targets_good, add_special_tokens=False)["input_ids"]
-    ]
-    data_dict["target bad"] = [
-        token_ids[first_token_idx] for token_ids in
-        disco_gp.tokenizer(targets_bad, add_special_tokens=False)["input_ids"]
+        ids[0] for ids in disco_gp.tokenizer(tb, add_special_tokens=False)["input_ids"]
     ]
     # Split into train / (dev+test) first, then split latter into dev / test
     dev_test, test_over_dev = split_ratios(disco_gp.cfg.ds_split_ratios)

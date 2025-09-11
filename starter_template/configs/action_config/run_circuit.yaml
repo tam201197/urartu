@@ -5,16 +5,15 @@ debug: false
 action_config:
   experiment_name: "discogp with blimp"
   device: "cuda" # auto, cuda, cpu (default)
-  seed: 42
-  modes: 'we'
+  
 
   model:
     name: "gpt2" #[gpt2, Qwen/Qwen3-0.6B, Qwen/Qwen3-1.7B, meta-llama/Llama-3.2-1B-Instruct]
     dtype: torch.bfloat16 #["torch.bf16", "torch.fp16", "torch.fp32"]
 
   dataset:
-    task_type: 'glue-qqp' #["pararel", "ioi", "blimp", "glue-sst2", "dbpedia_14", "glue-qqp"]  
-    batch_size: 16
+    task_type: 'snli' #["pararel", "ioi", "blimp", "glue-sst2", "dbpedia_14", "glue-qqp"]  
+    batch_size: 8
     train_split: 0.8
     dev_split: 0.1
     test_split: 0.1
@@ -38,10 +37,10 @@ action_config:
     n_data: 100
   
   glue-qqp:
-    max_train_samples: 20000
-    max_val_samples: 2000
-    max_test_samples: 2000
     n_per_class: 500
+
+  snli:
+    n_per_class: 300  
 
   pararel:
     pararel_rel_ids: P36 # ['P103', 'P127', 'P136', 'P138', 'P140', 'P159', 'P176', 'P19', 'P20', 'P264',
@@ -50,9 +49,6 @@ action_config:
   
   glue-sst2:
     n_per_class: 500
-
-  winogrande:
-    task_size: winogrande_s
 
   optuna:
     use_optuna: False
@@ -93,4 +89,8 @@ action_config:
 
   exp_cfg:
     evaluate_every: 1
+    save_mask: False
+    device: "cuda"
+    modes: 'we'
+    seed: 42
 
